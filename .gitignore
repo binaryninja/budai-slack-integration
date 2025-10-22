@@ -1,0 +1,14 @@
+﻿__pycache__/
+*.pyc
+.env
+.env.local
+.venv/
+.idea/
+.vscode/
+pytest_cache/
+
+# build artifacts
+dist/
+build/
+
+.DS_Store
