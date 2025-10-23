@@ -1,4 +1,9 @@
-﻿"""\nSlack Integration HTTP service.\n\nBridges BudAI workflows with Slack APIs for call management and messaging.\n"""
+"""
+Slack Integration HTTP service.
+
+Bridges BudAI workflows with Slack APIs for call management and messaging, and
+coordinates voice session setup with the Voice Realtime service.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +13,14 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -39,6 +47,7 @@ from .session_store import CallSessionStore
 from .slack_client import SlackClient
 
 logger = logging.getLogger(__name__)
+
 
 def verify_slack_signature(
     *,
@@ -69,6 +78,31 @@ def verify_slack_signature(
     return hmac.compare_digest(expected, signature)
 
 
+def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO-8601 timestamps (with or without Z suffix)."""
+    if not value:
+        return None
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned)
+    except ValueError:
+        logger.debug("Failed to parse ISO timestamp: %s", value)
+        return None
+
+
+def _build_websocket_url(base_url: str, endpoint: Optional[str]) -> Optional[str]:
+    """Build a websocket URL from the voice realtime base and relative endpoint."""
+    if not endpoint:
+        return None
+
+    parsed = urlparse(base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    netloc = parsed.netloc
+    base_path = parsed.path.rstrip("/")
+    endpoint_path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+    return f"{scheme}://{netloc}{base_path}{endpoint_path}"
+
+
 class SlackIntegrationService:
     """Service encapsulating Slack operations."""
 
@@ -82,6 +116,11 @@ class SlackIntegrationService:
         self.event_bus = create_event_bus(self.settings.redis_url)
         self.session_store = CallSessionStore(self.event_bus.redis)
         self.slack_client = SlackClient(self.settings.slack_bot_token)
+        self.voice_client = httpx.AsyncClient(
+            base_url=self.settings.voice_realtime_url.rstrip("/"),
+            headers={"Content-Type": "application/json"},
+            timeout=httpx.Timeout(10.0, connect=5.0),
+        )
 
         self._register_health_checks()
 
@@ -111,6 +150,59 @@ class SlackIntegrationService:
     async def shutdown(self) -> None:
         logger.info("Shutting down Slack integration service")
         await self.slack_client.close()
+        await self.voice_client.aclose()
+
+    async def _fetch_voice_session(self, session: CallSession, team_id: Optional[str]) -> CallSession:
+        """Create a realtime voice session for the call and attach credentials."""
+        metadata = {
+            **session.metadata,
+            "topic": session.topic,
+            "agenda": session.agenda,
+            "team_id": team_id,
+        }
+        session.metadata = metadata
+
+        payload: Dict[str, Any] = {
+            "call_id": session.call_id,
+            "slack_user_id": session.user_id,
+            "channel_id": session.channel_id,
+            "external_id": session.external_id,
+            "metadata": metadata,
+        }
+
+        try:
+            response = await self.voice_client.post("/session-token", json=payload)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.error("Voice realtime session creation failed: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail="Voice realtime service unavailable",
+            ) from exc
+
+        data = response.json()
+        session.session_id = data.get("session_id")
+        session.voice_openai_session_id = data.get("openai_session_id")
+        session.voice_client_secret = data.get("client_secret")
+        session.voice_expires_at = _parse_iso8601(data.get("expires_at"))
+        endpoint = data.get("websocket_endpoint")
+        session.voice_websocket_url = _build_websocket_url(
+            self.settings.voice_realtime_url,
+            endpoint,
+        )
+
+        voice_meta = session.metadata.setdefault("voice", {})
+        voice_meta.update(
+            {
+                "websocket_endpoint": endpoint,
+                "client_secret": session.voice_client_secret,
+                "openai_session_id": session.voice_openai_session_id,
+                "expires_at": data.get("expires_at"),
+            }
+        )
+
+        return session
+
     async def create_call(self, payload: CreateCallRequest) -> CallSessionResponse:
         call_id = f"call-{payload.external_id or payload.channel_id}-{int(time.time())}"
         session = CallSession(
@@ -120,8 +212,11 @@ class SlackIntegrationService:
             channel_id=payload.channel_id,
             agenda=payload.agenda,
             topic=payload.topic,
-            metadata=payload.metadata,
+            metadata=dict(payload.metadata),
         )
+        if payload.title and "title" not in session.metadata:
+            session.metadata["title"] = payload.title
+        session = await self._fetch_voice_session(session, payload.team_id)
         await self.session_store.save(session)
 
         join_url = session.metadata.get("join_url") or self.settings.default_join_url
@@ -136,11 +231,13 @@ class SlackIntegrationService:
             logger.warning("Slack call creation failed: %s", exc)
 
         log_event(
-            "slack.call.created",
-            {
+            "info",
+            "Slack call created",
+            context={
                 "call_id": session.call_id,
                 "channel_id": session.channel_id,
                 "user_id": session.user_id,
+                "voice_session_id": session.session_id,
             },
         )
 
@@ -193,6 +290,7 @@ class SlackIntegrationService:
             blocks=[block.model_dump(exclude_none=True) for block in payload.blocks],
             private_metadata=payload.private_metadata,
         )
+
 
 service = SlackIntegrationService()
 app = FastAPI(title="BudAI Slack Integration", version="1.0.0")

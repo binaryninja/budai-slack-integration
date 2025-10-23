@@ -15,6 +15,8 @@ class CreateCallRequest(BaseModel):
 
     channel_id: str
     user_id: str
+    team_id: Optional[str] = None
+    title: Optional[str] = None
     topic: Optional[str] = None
     agenda: Optional[str] = None
     external_id: Optional[str] = None
@@ -32,6 +34,10 @@ class CallSession(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     ended_at: Optional[datetime] = None
     session_id: Optional[str] = None
+    voice_openai_session_id: Optional[str] = None
+    voice_client_secret: Optional[str] = None
+    voice_expires_at: Optional[datetime] = None
+    voice_websocket_url: Optional[str] = None
     agenda: Optional[str] = None
     topic: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -48,6 +54,10 @@ class CallSessionResponse(BaseModel):
     created_at: datetime
     ended_at: Optional[datetime] = None
     session_id: Optional[str] = None
+    voice_openai_session_id: Optional[str] = None
+    voice_client_secret: Optional[str] = None
+    voice_expires_at: Optional[datetime] = None
+    voice_websocket_url: Optional[str] = None
     agenda: Optional[str] = None
     topic: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)

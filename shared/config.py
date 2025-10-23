@@ -216,6 +216,10 @@ class SlackIntegrationSettings(BaseServiceSettings):
         "https://example.com/join",
         description="Fallback join URL for generated Slack calls",
     )
+    voice_realtime_url: str = Field(
+        "http://voice-realtime:8005",
+        description="Base URL for the voice realtime service",
+    )
 
 
 def load_deployment_spec(environment: str, specs_dir: Path | str = "specs") -> DeploymentSpec:
@@ -257,4 +261,3 @@ def create_service_settings(service_name: str) -> BaseServiceSettings:
 
     settings_class = settings_map.get(service_name, BaseServiceSettings)
     return settings_class()
-
